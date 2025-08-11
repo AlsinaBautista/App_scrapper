@@ -22,13 +22,14 @@ import io
 import re
 from typing import Dict, List, Optional
 
+from urllib.parse import urljoin, urlparse
+
 import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
-from uuid import uuid4
-from urllib.parse import urljoin, urlparse
+
 PROGRESS = {}     # job_id -> {"done": int, "total": int, "status": "running"/"finished"}
 RESULTS = {}      # job_id -> BytesIO con el Excel
 
@@ -162,33 +163,52 @@ async def fetch_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
     except Exception:
         return None
 
-
 async def lookup_in_store(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
-    """Intenta por API de VTEX (alternateIds_Ean) y luego por página de búsqueda.
-    Devuelve la URL o "no encontrado".
-    """
-    # 1) API por EAN (VTEX)
-    api_url = build_api_url(base_url, ean)
+    """VTEX: pruebo por EAN exacto y luego fulltext, y por último HTML."""
+    # 1) API por EAN exacto
+    api_url = f"{base_url.rstrip('/')}/api/catalog_system/pub/products/search/?fq=alternateIds_Ean:{ean}"
     data = await fetch_json(client, api_url)
     if isinstance(data, list) and data:
         prod = data[0]
         link = prod.get("link") or prod.get("linkText")
         if link:
-            # Si vino linkText, construimos PDP
             if not link.startswith("http"):
                 if "/" not in link:
                     link = f"{base_url.rstrip('/')}/{link}/p"
                 else:
                     link = f"{base_url.rstrip('/')}/{link}"
-            # Validar que realmente sea PDP
-            if is_valid_pdp(link, base_url):
-                return link
-        # fallback dentro de API si no trajo link usable
+            # En VTEX aceptamos PDP aunque no termine en /p si vino como link absoluto
+            return link
         lt = prod.get("linkText")
         if lt:
-            candidate = f"{base_url.rstrip('/')}/{lt}/p"
-            if is_valid_pdp(candidate, base_url):
-                return candidate
+            return f"{base_url.rstrip('/')}/{lt}/p"
+
+    # 2) API full-text (algunas tiendas indexan el EAN sólo por ft)
+    ft_url = f"{base_url.rstrip('/')}/api/catalog_system/pub/products/search/?ft={ean}"
+    data = await fetch_json(client, ft_url)
+    if isinstance(data, list) and data:
+        prod = data[0]
+        link = prod.get("link") or prod.get("linkText")
+        if link:
+            if not link.startswith("http"):
+                if "/" not in link:
+                    link = f"{base_url.rstrip('/')}/{link}/p"
+                else:
+                    link = f"{base_url.rstrip('/')}/{link}"
+            return link
+        lt = prod.get("linkText")
+        if lt:
+            return f"{base_url.rstrip('/')}/{lt}/p"
+
+    # 3) Página de resultados (HTML)
+    search_url = f"{base_url.rstrip('/')}/{ean}?_q={ean}&map=ft"
+    html = await fetch_text(client, search_url)
+    if html:
+        maybe = first_product_link_from_html(html, base_url)
+        if maybe and is_valid_pdp(maybe, base_url):
+            return maybe
+
+    return "no encontrado"
 
     # 2) Página de búsqueda genérica
     search_url = build_search_page_url(base_url, ean)
