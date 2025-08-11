@@ -41,7 +41,7 @@ STORES: Dict[str, str] = {
     "dia": "https://diaonline.supermercadosdia.com.ar",
     "farmacity": "https://www.farmacity.com",
     "mas_online": "https://www.masonline.com.ar",
-    "pigmento": "https://www.pigmento.com.ar",
+    "pigmento": "https://www.perfumeriaspigmento.com.ar",
     "coto": "https://www.cotodigital3.com.ar",
     "mercado_libre": "https://listado.mercadolibre.com.ar",
     "club_de_beneficios": "https://clubdebeneficios.com",
@@ -211,6 +211,61 @@ async def lookup_in_store(client: httpx.AsyncClient, store_name: str, base_url: 
     return "no encontrado"
 
 # --- Handlers específicos para tiendas no-VTEX ---
+async def lookup_meli_robusto(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
+    """Mercado Libre: intentar API pública y caer a HTML si hace falta.
+    - API (puede requerir token en 2025): /sites/MLA/search?q=<EAN>
+    - HTML: listado y rutas alternativas; devolver primer permalink a ítem (/MLA-...) o PDP de catálogo (/p/MLA...)
+    """
+    api = f"https://api.mercadolibre.com/sites/MLA/search?q={ean}&limit=1"
+    try:
+        r = await client.get(api, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, dict):
+                results = j.get("results") or []
+                if results:
+                    link = results[0].get("permalink")
+                    if link:
+                        return link
+    except Exception:
+        pass
+
+    bases = [base_url.rstrip("/"), "https://www.mercadolibre.com.ar"]
+    paths = [f"/{ean}", f"/jm/search?as_word={ean}", f"/ofertas?query={ean}"]
+
+    def looks_like_meli_item(u: str) -> bool:
+        try:
+            uu = urlparse(u)
+        except Exception:
+            return False
+        host_ok = "mercadolibre" in uu.netloc
+        path = uu.path
+        return host_ok and ("/MLA-" in path or "/p/MLA" in path or "/item/" in path or "/up/MLA" in path)
+
+    for b in bases:
+        for p in paths:
+            url = b + p
+            html = await fetch_text(client, url)
+            if not html:
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if not href:
+                    continue
+                full = href if href.startswith("http") else urljoin("https://www.mercadolibre.com.ar/", href)
+                if looks_like_meli_item(full) and not any(x in full for x in ("/login", "/account", "/ayuda", "/help", "/seguridad")):
+                    return full
+            for tag in soup.select("[data-url], [data-href], [data-link]"):
+                val = tag.get("data-url") or tag.get("data-href") or tag.get("data-link")
+                if not val:
+                    continue
+                full = val if val.startswith("http") else urljoin("https://www.mercadolibre.com.ar/", val)
+                if looks_like_meli_item(full) and not any(x in full for x in ("/login", "/account", "/ayuda", "/help", "/seguridad")):
+                    return full
+
+    return "no encontrado"
+
 async def lookup_meli(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
     """Mercado Libre: buscar por EAN y devolver el primer item (MLA-...)."""
     search_url = f"{base_url.rstrip('/')}/{ean}"
@@ -232,31 +287,54 @@ async def lookup_meli(client: httpx.AsyncClient, store_name: str, base_url: str,
     return "no encontrado"
 
 async def lookup_coto(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
-    """Coto: probar varias URLs de búsqueda y tomar primer producto (ruta con 'producto'/'productos'/'product' o '/p/')."""
+    """
+    Coto (Oracle Commerce/Endeca):
+    - Buscar en páginas 'browse' con Ntt=<EAN>
+    - Tomar el primer link que apunte a '/sitios/cdigi/producto/_/A-...'
+    """
+    base = base_url.rstrip("/")
     candidates = [
-        f"{base_url.rstrip('/')}/sitios/cd3/busca?keyword={ean}",
-        f"{base_url.rstrip('/')}/busca?keyword={ean}",
-        f"{base_url.rstrip('/')}/buscar?q={ean}",
-        f"{base_url.rstrip('/')}/buscar?texto={ean}",
-        f"{base_url.rstrip('/')}/s?q={ean}",
+        f"{base}/sitios/cdigi/browse/_/N-?Dy=1&Ntk=All&Ntt={ean}&Nty=1",
+        f"{base}/sitios/cdigi/browse/_/N-?Ntk=All&Ntt={ean}",
+        f"{base}/sitios/cdigi/browse/_/N-?Ntt={ean}",
     ]
+
+    def looks_like_pdp(u: str) -> bool:
+        try:
+            uu = urlparse(u)
+        except Exception:
+            return False
+        return (
+            "cotodigital3.com.ar" in uu.netloc
+            and "/sitios/cdigi/producto/_/A-" in uu.path
+        )
+
     for url in candidates:
         html = await fetch_text(client, url)
         if not html:
             continue
         soup = BeautifulSoup(html, "html.parser")
+
+        # 1) anchors <a href="...">
         for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
+            href = (a["href"] or "").strip()
             if not href or href.startswith("#"):
                 continue
-            full = href if href.startswith("http") else urljoin(base_url.rstrip("/") + "/", href)
-            try:
-                uu = urlparse(full)
-            except Exception:
-                continue
-            if ("coto" in uu.netloc) and ("/producto" in uu.path or "/productos" in uu.path or "/product" in uu.path or "/p/" in uu.path):
+            full = href if href.startswith("http") else urljoin(base + "/", href)
+            if looks_like_pdp(full):
                 return full
+
+        # 2) posibles URLs en data-* atributos (algunas plantillas lo usan)
+        for tag in soup.select("[data-url], [data-href], [data-product-url]"):
+            val = tag.get("data-url") or tag.get("data-href") or tag.get("data-product-url")
+            if not val:
+                continue
+            full = val if val.startswith("http") else urljoin(base + "/", val)
+            if looks_like_pdp(full):
+                return full
+
     return "no encontrado"
+
 
 async def lookup_club_beneficios(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
     """Club de Beneficios: usa Magento. Buscamos por EAN y validamos que el PDP contenga el EAN."""
@@ -290,7 +368,7 @@ async def lookup_club_beneficios(client: httpx.AsyncClient, store_name: str, bas
 # Registrar handlers por tienda (por defecto: VTEX -> lookup_in_store)
 LOOKUP_HANDLERS = {
     "coto": lookup_coto,
-    "mercado_libre": lookup_meli,
+    "mercado_libre": lookup_meli_robusto,
     "club_de_beneficios": lookup_club_beneficios,
 }
 
