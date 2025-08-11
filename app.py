@@ -41,6 +41,12 @@ STORES: Dict[str, str] = {
     "disco": "https://www.disco.com.ar",
     "vea": "https://www.vea.com.ar",
     "dia": "https://diaonline.supermercadosdia.com.ar",
+    "farmacity": "https://www.farmacity.com",
+    "mas_online": "https://www.masonline.com.ar",
+    "pigmento": "https://www.pigmento.com.ar",
+    "coto": "https://www.cotodigital3.com.ar",
+    "mercado_libre": "https://listado.mercadolibre.com.ar",
+    "club_de_beneficios": "https://clubdebeneficios.com",
 }
 
 # Concurrencia (ajustá si necesitás ser más/menos agresivo)
@@ -194,6 +200,91 @@ async def lookup_in_store(client: httpx.AsyncClient, store_name: str, base_url: 
 
     return "no encontrado"
 
+# --- Handlers específicos para tiendas no-VTEX ---
+async def lookup_meli(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
+    """Mercado Libre: buscar por EAN y devolver el primer item (MLA-...)."""
+    search_url = f"{base_url.rstrip('/')}/{ean}"
+    html = await fetch_text(client, search_url)
+    if not html:
+        return "no encontrado"
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href:
+            continue
+        full = href if href.startswith("http") else urljoin(base_url.rstrip("/") + "/", href)
+        try:
+            uu = urlparse(full)
+        except Exception:
+            continue
+        if "mercadolibre.com" in uu.netloc and "/MLA-" in uu.path:
+            return full
+    return "no encontrado"
+
+async def lookup_coto(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
+    """Coto: probar varias URLs de búsqueda y tomar primer producto (ruta con 'producto'/'productos'/'product' o '/p/')."""
+    candidates = [
+        f"{base_url.rstrip('/')}/sitios/cd3/busca?keyword={ean}",
+        f"{base_url.rstrip('/')}/busca?keyword={ean}",
+        f"{base_url.rstrip('/')}/buscar?q={ean}",
+        f"{base_url.rstrip('/')}/buscar?texto={ean}",
+        f"{base_url.rstrip('/')}/s?q={ean}",
+    ]
+    for url in candidates:
+        html = await fetch_text(client, url)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href or href.startswith("#"):
+                continue
+            full = href if href.startswith("http") else urljoin(base_url.rstrip("/") + "/", href)
+            try:
+                uu = urlparse(full)
+            except Exception:
+                continue
+            if ("coto" in uu.netloc) and ("/producto" in uu.path or "/productos" in uu.path or "/product" in uu.path or "/p/" in uu.path):
+                return full
+    return "no encontrado"
+
+async def lookup_club_beneficios(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
+    """Club de Beneficios: usa Magento. Buscamos por EAN y validamos que el PDP contenga el EAN."""
+    search_url = f"{base_url.rstrip('/')}/catalogsearch/result/?q={ean}"
+    html = await fetch_text(client, search_url)
+    candidates = []
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href or href.startswith("#"):
+                continue
+            full = href if href.startswith("http") else urljoin(base_url.rstrip("/") + "/", href)
+            try:
+                uu = urlparse(full)
+            except Exception:
+                continue
+            if "clubdebeneficios.com" in uu.netloc and uu.path.endswith(".html"):
+                leaf = uu.path.split("/")[-1]
+                # excluir categorías conocidas
+                if leaf in {"productos.html","limpieza.html","almacen.html","bebidas.html","perfumeria.html","ofertas-imperdibles.html"}:
+                    continue
+                candidates.append(full)
+    # Validar que el PDP contenga el EAN en el HTML (SKU/gtin)
+    for url in candidates:
+        page = await fetch_text(client, url)
+        if page and ean in page:
+            return url
+    return "no encontrado"
+
+# Registrar handlers por tienda (por defecto: VTEX -> lookup_in_store)
+LOOKUP_HANDLERS = {
+    "coto": lookup_coto,
+    "mercado_libre": lookup_meli,
+    "club_de_beneficios": lookup_club_beneficios,
+}
+
+
 async def process_eans(eans: List[str], progress_cb=None) -> pd.DataFrame:
     rows = []
     sem = asyncio.Semaphore(MAX_PARALLEL_PER_EAN)
@@ -214,6 +305,7 @@ async def process_eans(eans: List[str], progress_cb=None) -> pd.DataFrame:
 
             async def task_for(store_name: str, base_url: str) -> str:
                 async with sem:
+                    handler = LOOKUP_HANDLERS.get(store_name, lookup_in_store)
                     return await lookup_in_store(client, store_name, base_url, ean)
 
             tasks = [task_for(n, u) for n, u in STORES.items()]
