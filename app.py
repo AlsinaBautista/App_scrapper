@@ -31,10 +31,6 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-PROGRESS = {}     # job_id -> {"done": int, "total": int, "status": "running"/"finished"}
-RESULTS = {}      # job_id -> BytesIO con el Excel
-
-
 # --------------------------- Configuración ---------------------------
 # Supermercados objetivo (podés agregar/quitar sin tocar el resto del código)
 STORES: Dict[str, str] = {
@@ -71,6 +67,9 @@ DISALLOWED_PARTS = (
     "/minicart", "/wishlist", "/customer", "#/orders",
     "_q=", "map=ft",
 )
+
+PROGRESS: Dict[str, Dict[str, int | str]] = {}
+RESULTS: Dict[str, io.BytesIO] = {}
 
 def is_valid_pdp(url: str, base_url: str) -> bool:
     """Acepta solo PDPs reales del mismo host. En VTEX exigimos que el path termine en '/p'."""
@@ -179,13 +178,12 @@ async def lookup_in_store(client: httpx.AsyncClient, store_name: str, base_url: 
                     link = f"{base_url.rstrip('/')}/{link}/p"
                 else:
                     link = f"{base_url.rstrip('/')}/{link}"
-            # En VTEX aceptamos PDP aunque no termine en /p si vino como link absoluto
             return link
         lt = prod.get("linkText")
         if lt:
             return f"{base_url.rstrip('/')}/{lt}/p"
 
-    # 2) API full-text (algunas tiendas indexan el EAN sólo por ft)
+    # 2) API full-text (algunas tiendas indexan el EAN solo por ft)
     ft_url = f"{base_url.rstrip('/')}/api/catalog_system/pub/products/search/?ft={ean}"
     data = await fetch_json(client, ft_url)
     if isinstance(data, list) and data:
@@ -204,16 +202,6 @@ async def lookup_in_store(client: httpx.AsyncClient, store_name: str, base_url: 
 
     # 3) Página de resultados (HTML)
     search_url = f"{base_url.rstrip('/')}/{ean}?_q={ean}&map=ft"
-    html = await fetch_text(client, search_url)
-    if html:
-        maybe = first_product_link_from_html(html, base_url)
-        if maybe and is_valid_pdp(maybe, base_url):
-            return maybe
-
-    return "no encontrado"
-
-    # 2) Página de búsqueda genérica
-    search_url = build_search_page_url(base_url, ean)
     html = await fetch_text(client, search_url)
     if html:
         maybe = first_product_link_from_html(html, base_url)
@@ -359,6 +347,52 @@ async def run_job(job_id: str, eans: List[str]) -> None:
 
 # --------------------------- FastAPI ---------------------------
 app = FastAPI(title="Buscador de URLs por EAN", version="1.0.0")
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Subí un .xlsx (Excel moderno)")
+
+    # Leer Excel en memoria (forzar str para no perder ceros)
+    raw = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(raw), dtype=str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No pude leer el Excel: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="El Excel está vacío")
+
+    # Detectar columna EAN (case-insensitive)
+    cols_norm = {c.strip(): c for c in df.columns}
+    target_col = None
+    for c in cols_norm:
+        if c.lower() == "ean":
+            target_col = cols_norm[c]
+            break
+    if target_col is None:
+        raise HTTPException(status_code=400, detail="No encontré una columna llamada 'EAN'")
+
+    eans = [sanitize_ean(v) for v in df[target_col].tolist()]
+
+    # Procesar
+    out_df = await process_eans(eans)
+
+    # Armar Excel en memoria
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="Resultados")
+    buf.seek(0)
+
+    filename = re.sub(r"[^\w\-]+", "_", file.filename.rsplit(".", 1)[0]) + "_resultados.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Cache-Control": "no-store",
+        },
+    )
 @app.post("/start")
 async def start(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".xlsx"):
@@ -437,7 +471,7 @@ async def index() -> str:
       <h1>🔎 Buscador de URLs por EAN</h1>
       <p class="lead">Subí un <strong>Excel (.xlsx)</strong> con una columna llamada <code class="k">EAN</code>. Te devuelvo otro Excel con el primer resultado por supermercado.</p>
       <ul>
-        <li>Soporta: Carrefour, Jumbo, Disco, Vea y Día.</li>
+        <li>Soporta: Carrefour, Jumbo, Disco, Vea, Día, Farmacity, Más Online, Pigmento, Coto, Mercado Libre y Club de Beneficios.</li>
         <li>Si no se encuentra el producto en un sitio, verás <em>"no encontrado"</em>.</li>
         <li>Los códigos se tratan como texto para preservar ceros a la izquierda.</li>
       </ul>
@@ -467,7 +501,10 @@ form.addEventListener('submit', async (e) => {
   const fd = new FormData(form);
   try {
     const start = await fetch('/start', { method: 'POST', body: fd });
-    if (!start.ok) throw new Error('Error iniciando el procesamiento');
+        if (!start.ok) {
+    const txt = await start.text();  // <-- lee el detalle del backend
+    throw new Error(txt || 'Error iniciando el procesamiento');
+    }
     const data = await start.json();
     await poll(data.job_id);
   } catch (err) {
@@ -511,51 +548,6 @@ async function poll(job) {
 </html>
     """
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Subí un .xlsx (Excel moderno)")
-
-    # Leer Excel en memoria (forzar str para no perder ceros)
-    raw = await file.read()
-    try:
-        df = pd.read_excel(io.BytesIO(raw), dtype=str)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"No pude leer el Excel: {e}")
-
-    if df.empty:
-        raise HTTPException(status_code=400, detail="El Excel está vacío")
-
-    # Detectar columna EAN (case-insensitive)
-    cols_norm = {c.strip(): c for c in df.columns}
-    target_col = None
-    for c in cols_norm:
-        if c.lower() == "ean":
-            target_col = cols_norm[c]
-            break
-    if target_col is None:
-        raise HTTPException(status_code=400, detail="No encontré una columna llamada 'EAN'")
-
-    eans = [sanitize_ean(v) for v in df[target_col].tolist()]
-
-    # Procesar
-    out_df = await process_eans(eans)
-
-    # Armar Excel en memoria
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        out_df.to_excel(writer, index=False, sheet_name="Resultados")
-    buf.seek(0)
-
-    filename = re.sub(r"[^\w\-]+", "_", file.filename.rsplit(".", 1)[0]) + "_resultados.xlsx"
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}",
-            "Cache-Control": "no-store",
-        },
-    )
 
 
 # --------------------------- Healthcheck sencillo ---------------------------
