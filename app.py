@@ -17,6 +17,7 @@ Abrí http://127.0.0.1:8000/ y probá.
 """
 from __future__ import annotations
 
+from uuid import uuid4
 import asyncio
 import io
 import re
@@ -68,6 +69,7 @@ DEFAULT_HEADERS = {
 DISALLOWED_PARTS = (
     "/account", "/login", "/orders", "/order", "/cart",
     "/minicart", "/wishlist", "/customer", "#/orders",
+    "_q=", "map=ft",
 )
 
 def is_valid_pdp(url: str, base_url: str) -> bool:
@@ -326,7 +328,7 @@ async def process_eans(eans: List[str], progress_cb=None) -> pd.DataFrame:
             async def task_for(store_name: str, base_url: str) -> str:
                 async with sem:
                     handler = LOOKUP_HANDLERS.get(store_name, lookup_in_store)
-                    return await lookup_in_store(client, store_name, base_url, ean)
+                    return await handler(client, store_name, base_url, ean)  # <-- usar handler
 
             tasks = [task_for(n, u) for n, u in STORES.items()]
             results = await asyncio.gather(*tasks)
