@@ -24,7 +24,8 @@ import re
 from typing import Dict, List, Optional
 
 from urllib.parse import urljoin, urlparse
-
+import json
+from functools import lru_cache
 import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -88,6 +89,15 @@ DISALLOWED_PARTS = (
 
 PROGRESS: Dict[str, Dict[str, int | str]] = {}
 RESULTS: Dict[str, io.BytesIO] = {}
+
+def normalize_base_url(u: str) -> str:
+    """Normaliza la URL base de una tienda: agrega https:// si falta y quita barras finales."""
+    if not u:
+        return ""
+    u = u.strip()
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "https://" + u.lstrip("/")
+    return u.rstrip("/")
 
 def is_valid_pdp(url: str, base_url: str) -> bool:
     """Acepta solo PDPs reales del mismo host. En VTEX exigimos que el path termine en '/p'."""
@@ -228,7 +238,254 @@ async def lookup_in_store(client: httpx.AsyncClient, store_name: str, base_url: 
 
     return "no encontrado"
 
+# ---------------------- Plataforma + Heurísticas genéricas ----------------------
+
+class Platform:
+    VTEX = "vtex"
+    MAGENTO = "magento"
+    PRESTASHOP = "prestashop"
+    SHOPIFY = "shopify"
+    WOOCOMMERCE = "woocommerce"
+    TIENDANUBE = "tiendanube"
+    UNKNOWN = "unknown"
+
+BANNED_FRAGMENTS = (
+    "/login", "/account", "/customer", "/cart", "/checkout", "/wishlist",
+    "/ofertas", "/sale", "/help", "/ayuda"
+)
+
+def _host(u: str) -> str:
+    try:
+        return urlparse(u).netloc
+    except Exception:
+        return ""
+
+def _abs(base: str, href: str) -> str:
+    if not href: return ""
+    href = href.strip()
+    if href.startswith("//"): return "https:" + href
+    if href.startswith("http"): return href
+    return urljoin(base.rstrip("/") + "/", href.lstrip("/"))
+
+def _seems_pdp(u: str, platform: str) -> bool:
+    low = (u or "").lower()
+    if any(x in low for x in BANNED_FRAGMENTS):
+        return False
+    path = urlparse(low).path
+
+    if platform == Platform.VTEX:
+        return path.rstrip("/").endswith("/p")
+    if platform == Platform.MAGENTO:
+        return path.endswith(".html")
+    if platform == Platform.PRESTASHOP:
+        # suele haber ID numérico y .html
+        return path.endswith(".html")
+    if platform == Platform.SHOPIFY:
+        return "/products/" in path
+    if platform == Platform.WOOCOMMERCE:
+        return "/product/" in path and "/product-category/" not in path
+    if platform == Platform.TIENDANUBE:
+        return "/productos/" in path and "/colecciones/" not in path
+
+    # genérico
+    return any(seg in path for seg in ("/product", "/producto", "/products", "/productos")) or path.endswith(".html")
+
+def _jsonld_items(html: str):
+    out = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                data = json.loads(s.string or s.text or "")
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                out.append(data)
+            elif isinstance(data, list):
+                out.extend([d for d in data if isinstance(d, dict)])
+    except Exception:
+        pass
+    return out
+
+def _first_url_from_itemlist(html: str) -> Optional[str]:
+    for node in _jsonld_items(html):
+        if node.get("@type") in ("ItemList", "CollectionPage"):
+            items = node.get("itemListElement") or []
+            # ItemList puede tener dicts con {"@type":"ListItem","url":...} o {"item":{"@id"/"url":...}}
+            for el in items:
+                if isinstance(el, dict):
+                    url = el.get("url")
+                    if not url and isinstance(el.get("item"), dict):
+                        url = el["item"].get("url") or el["item"].get("@id")
+                    if url:
+                        return url
+    return None
+
+def _find_canonical(html: str) -> Optional[str]:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        link = soup.find("link", rel=lambda v: v and "canonical" in v)
+        if link and link.get("href"):
+            return link["href"].strip()
+    except Exception:
+        pass
+    return None
+
+def _detect_platform_from_html(html: str) -> str:
+    h = (html or "").lower()
+    # señales VTEX
+    if "vtex" in h or "/api/catalog_system/" in h or "vtexassets" in h:
+        return Platform.VTEX
+    # Magento
+    if "magento" in h or "mage-init" in h or "data-mage" in h:
+        return Platform.MAGENTO
+    # PrestaShop
+    if "prestashop" in h or "jolisearch" in h:
+        return Platform.PRESTASHOP
+    # Shopify
+    if "cdn.shopify.com" in h or "shopify" in h:
+        return Platform.SHOPIFY
+    # WooCommerce / WordPress
+    if "woocommerce" in h or "wp-content" in h or "wc-add-to-cart" in h:
+        return Platform.WOOCOMMERCE
+    # Tiendanube
+    if "tiendanube" in h or "nuvemshop" in h:
+        return Platform.TIENDANUBE
+    return Platform.UNKNOWN
+
+@lru_cache(maxsize=256)
+def _search_recipes_for(platform: str):
+    # Cada receta es una función lambda base, q -> url
+    if platform == Platform.VTEX:
+        return [
+            lambda base, q: f"{base.rstrip('/')}/api/catalog_system/pub/products/search/?fq=alternateIds_Ean:{q}",
+            lambda base, q: f"{base.rstrip('/')}/api/catalog_system/pub/products/search/?ft={q}",
+            lambda base, q: f"{base.rstrip('/')}/{q}?_q={q}&map=ft",
+        ]
+    if platform == Platform.MAGENTO:
+        return [
+            lambda base, q: f"{base.rstrip('/')}/catalogsearch/result/?q={q}",
+        ]
+    if platform == Platform.PRESTASHOP:
+        return [
+            lambda base, q: f"{base.rstrip('/')}/module/ambjolisearch/jolisearch?s={q}",
+            lambda base, q: f"{base.rstrip('/')}/search?controller=search&s={q}",
+            lambda base, q: f"{base.rstrip('/')}/?s={q}",
+        ]
+    if platform == Platform.SHOPIFY:
+        return [
+            lambda base, q: f"{base.rstrip('/')}/search?q={q}",
+            lambda base, q: f"{base.rstrip('/')}/search/products?q={q}",
+        ]
+    if platform == Platform.WOOCOMMERCE:
+        return [
+            lambda base, q: f"{base.rstrip('/')}/?s={q}",
+            lambda base, q: f"{base.rstrip('/')}/?post_type=product&s={q}",
+        ]
+    if platform == Platform.TIENDANUBE:
+        return [
+            lambda base, q: f"{base.rstrip('/')}/buscar?q={q}",
+            lambda base, q: f"{base.rstrip('/')}/search?q={q}",
+        ]
+    # Genéricas
+    return [
+        lambda base, q: f"{base.rstrip('/')}/search?q={q}",
+        lambda base, q: f"{base.rstrip('/')}/buscar?q={q}",
+        lambda base, q: f"{base.rstrip('/')}/busca?q={q}",
+        lambda base, q: f"{base.rstrip('/')}/catalogsearch/result/?q={q}",
+        lambda base, q: f"{base.rstrip('/')}/?s={q}",
+        lambda base, q: f"{base.rstrip('/')}/?q={q}",
+    ]
+
+def _first_pdp_from_html_generic(html: str, base: str, platform: str) -> Optional[str]:
+    if not html: 
+        return None
+    basehost = _host(base)
+
+    # 1) Si la página actual ya es PDP (canonical dice PDP), devolvela
+    canon = _find_canonical(html)
+    if canon:
+        u = _abs(base, canon)
+        if _host(u).endswith(basehost) and _seems_pdp(u, platform):
+            return u
+
+    # 2) JSON-LD ItemList
+    u = _first_url_from_itemlist(html)
+    if u:
+        u = _abs(base, u)
+        if _host(u).endswith(basehost) and _seems_pdp(u, platform):
+            return u
+
+    # 3) Primer anchor que parezca PDP
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        u = _abs(base, a["href"])
+        if not u: 
+            continue
+        if not _host(u).endswith(basehost):
+            continue
+        if _seems_pdp(u, platform):
+            return u
+
+    return None
+
 # --- Handlers específicos para tiendas no-VTEX ---
+async def lookup_generic(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
+    """
+    Motor genérico:
+    - Detecta plataforma con el HTML del home o de la primera búsqueda genérica.
+    - Ejecuta recetas de búsqueda para esa plataforma y el EAN.
+    - Devuelve la PRIMERA PDP plausible. Si es VTEX y hay API, intenta link desde JSON.
+    """
+    base = base_url.rstrip("/")
+    # 0) Probar detección rápida leyendo el home
+    home_html = await fetch_text(client, base)
+    platform = _detect_platform_from_html(home_html or "")
+
+    # 1) Si parece VTEX, privilegiar API por EAN/ft (más veloz/preciso)
+    if platform == Platform.VTEX:
+        api1 = f"{base}/api/catalog_system/pub/products/search/?fq=alternateIds_Ean:{ean}"
+        data = await fetch_json(client, api1)
+        if isinstance(data, list) and data:
+            prod = data[0] or {}
+            link = (prod.get("link") or prod.get("linkText") or "").strip()
+            if link:
+                if not link.startswith("http"):
+                    link = f"{base}/{link}"
+                    if not link.endswith("/p"): link += "/p"
+                return link
+        api2 = f"{base}/api/catalog_system/pub/products/search/?ft={ean}"
+        data = await fetch_json(client, api2)
+        if isinstance(data, list) and data:
+            prod = data[0] or {}
+            link = (prod.get("link") or prod.get("linkText") or "").strip()
+            if link:
+                if not link.startswith("http"):
+                    link = f"{base}/{link}"
+                    if not link.endswith("/p"): link += "/p"
+                return link
+
+    # 2) Recetas de búsqueda por plataforma (o genéricas si UNKNOWN)
+    recipes = _search_recipes_for(platform)
+    for build in recipes:
+        url = build(base, ean)
+        html = await fetch_text(client, url)
+        if not html:
+            continue
+        u = _first_pdp_from_html_generic(html, base, platform)
+        if u:
+            # (Opcional) verificación: si el EAN aparece en la PDP, lo preferimos
+            try:
+                pdp_html = await fetch_text(client, u)
+                if pdp_html and ean in pdp_html:
+                    return u
+            except Exception:
+                pass
+            # Si no hay verificación, igual devolvemos la primera PDP encontrada
+            return u
+
+    return "no encontrado"
+
 async def lookup_meli_robusto(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
     """Mercado Libre: intentar API pública y caer a HTML si hace falta.
     - API (puede requerir token en 2025): /sites/MLA/search?q=<EAN>
@@ -515,7 +772,7 @@ async def process_eans(eans: List[str], progress_cb=None, stores_map: Optional[D
 
             async def task_for(store_name: str, base_url: str) -> str:
                 async with sem:
-                    handler = LOOKUP_HANDLERS.get(store_name, lookup_in_store)
+                    handler = LOOKUP_HANDLERS.get(store_name, lookup_generic)
                     try:
                         return await asyncio.wait_for(
                             handler(client, store_name, base_url, ean),
@@ -558,20 +815,24 @@ app = FastAPI(title="Buscador de URLs por EAN", version="1.0.0")
 @app.post("/upload")
 async def upload(
     file: UploadFile = File(...),
-    stores: Optional[List[str]] = Form(None)
+    stores: Optional[List[str]] = Form(None),
+    custom_slug: Optional[List[str]] = Form(None),
+    custom_name: Optional[List[str]] = Form(None),  # no se usa en backend, pero lo recibimos
+    custom_url: Optional[List[str]] = Form(None),
 ):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Subí un .xlsx (Excel moderno)")
 
+    # --- leer excel
     raw = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(raw), dtype=str)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"No pude leer el Excel: {e}")
-
     if df.empty:
         raise HTTPException(status_code=400, detail="El Excel está vacío")
 
+    # --- detectar columna EAN
     cols_norm = {c.strip(): c for c in df.columns}
     target_col = next((cols_norm[c] for c in cols_norm if c.lower() == "ean"), None)
     if target_col is None:
@@ -579,10 +840,37 @@ async def upload(
 
     eans = [sanitize_ean(v) for v in df[target_col].tolist()]
 
-    selected = {k: v for k, v in STORES.items() if k in set(stores)} if stores else STORES
+    # --- armar mapa de tiendas manuales
+    def _norm_url(u: str) -> str:
+        if not u:
+            return ""
+        u = u.strip()
+        if not u.startswith("http://") and not u.startswith("https://"):
+            u = "https://" + u.lstrip("/")
+        return u.rstrip("/")
 
+    custom_map: Dict[str, str] = {}
+    if custom_slug and custom_url:
+        for s, u in zip(custom_slug, custom_url):
+            s = (s or "").strip()
+            u = _norm_url(u or "")
+            if s and u:
+                custom_map[s] = u
+
+    # universo = predefinidas + manuales
+    all_stores = dict(STORES)
+    all_stores.update(custom_map)
+
+    # selección desde checkboxes; si no vino nada, usar todas por defecto (incluye manuales)
+    if stores:
+        selected = {k: v for k, v in all_stores.items() if k in set(stores)}
+        if not selected:
+            selected = all_stores
+    else:
+        selected = all_stores
+
+    # --- procesar y devolver excel
     out_df = await process_eans(eans, stores_map=selected)
-
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out_df.to_excel(writer, index=False, sheet_name="Resultados")
@@ -601,11 +889,15 @@ async def upload(
 @app.post("/start")
 async def start(
     file: UploadFile = File(...),
-    stores: Optional[List[str]] = Form(None)  # 👈 viene de los checkboxes name="stores"
+    stores: Optional[List[str]] = Form(None),
+    custom_slug: Optional[List[str]] = Form(None),
+    custom_name: Optional[List[str]] = Form(None),  # no se usa en backend, pero lo recibimos
+    custom_url: Optional[List[str]] = Form(None),
 ):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Subí un .xlsx (Excel moderno)")
 
+    # --- leer excel
     raw = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(raw), dtype=str)
@@ -614,7 +906,7 @@ async def start(
     if df.empty:
         raise HTTPException(status_code=400, detail="El Excel está vacío")
 
-    # columna EAN
+    # --- detectar columna EAN
     cols_norm = {c.strip(): c for c in df.columns}
     target_col = next((cols_norm[c] for c in cols_norm if c.lower() == "ean"), None)
     if target_col is None:
@@ -622,14 +914,36 @@ async def start(
 
     eans = [sanitize_ean(v) for v in df[target_col].tolist()]
 
-    # Filtrar tiendas según selección; si no vino nada, usamos todas.
-    if stores:
-        selected = {k: v for k, v in STORES.items() if k in set(stores)}
-        if not selected:
-            selected = STORES
-    else:
-        selected = STORES
+    # --- armar mapa de tiendas manuales
+    def _norm_url(u: str) -> str:
+        if not u:
+            return ""
+        u = u.strip()
+        if not u.startswith("http://") and not u.startswith("https://"):
+            u = "https://" + u.lstrip("/")
+        return u.rstrip("/")
 
+    custom_map: Dict[str, str] = {}
+    if custom_slug and custom_url:
+        for s, u in zip(custom_slug, custom_url):
+            s = (s or "").strip()
+            u = _norm_url(u or "")
+            if s and u:
+                custom_map[s] = u
+
+    # universo = predefinidas + manuales
+    all_stores = dict(STORES)
+    all_stores.update(custom_map)
+
+    # selección desde checkboxes; si no vino nada, usar todas por defecto (incluye manuales)
+    if stores:
+        selected = {k: v for k, v in all_stores.items() if k in set(stores)}
+        if not selected:
+            selected = all_stores
+    else:
+        selected = all_stores
+
+    # --- lanzar job asíncrono
     job_id = uuid4().hex
     PROGRESS[job_id] = {"done": 0, "total": len(eans), "status": "running"}
     asyncio.create_task(run_job(job_id, eans, stores_map=selected))
@@ -683,10 +997,9 @@ async def index() -> str:
     .nav a { color: var(--text); text-decoration:none; opacity:.9; }
     .nav a:hover { opacity:1; }
     .wrap { min-height:100dvh; display:grid; place-items:center; padding: 24px; }
-    .card { width: 100%; max-width: 920px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border: 1px solid rgba(255,255,255,.08); border-radius: 20px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    .card { width: 100%; max-width: 980px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border: 1px solid rgba(255,255,255,.08); border-radius: 20px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
     h1 { margin:0 0 8px; font-size: 26px; letter-spacing: .3px; }
     p.lead { margin:0 0 18px; color: var(--muted); }
-    ul { margin: 8px 0 20px 22px; color: var(--muted); }
     .upload { display:flex; flex-direction:column; gap:16px; margin-top: 14px; }
     label { font-size:14px; color: var(--muted); }
     input[type=file] { padding: 18px; border-radius: 14px; border: 1px dashed rgba(255,255,255,.18); background: rgba(255,255,255,.02); color: var(--text); }
@@ -702,6 +1015,13 @@ async def index() -> str:
     .store-opt { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; }
     .store-opt:hover { background:rgba(255,255,255,.04); }
     .tiny { font-size:12px; color:var(--muted); }
+
+    .manual { border:1px dashed rgba(255,255,255,.18); border-radius:14px; padding:12px; margin-top:10px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; }
+    .row input[type=text] { flex:1; min-width:200px; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.02); color: var(--text); }
+    .chip { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background: rgba(255,255,255,.08); margin-top:8px; }
+    .chip b { font-weight:600; }
+    .chip button { background:none; border:0; color:#fff; cursor:pointer; }
   </style>
 </head>
 <body>
@@ -717,7 +1037,7 @@ async def index() -> str:
   <div class="wrap">
     <div class="card">
       <h1>🔎 Procesar Excel con EAN</h1>
-      <p class="lead">Subí un <strong>Excel (.xlsx)</strong> con una columna llamada <code>EAN</code>. Elegí en qué tiendas buscar y te devuelvo otro Excel con el primer resultado por tienda.</p>
+      <p class="lead">Subí un <strong>Excel (.xlsx)</strong> con una columna llamada <code>EAN</code>. Elegí en qué tiendas buscar (incluye tiendas manuales) y descargá el Excel con resultados.</p>
 
       <form class="upload" id="form" enctype="multipart/form-data">
         <label for="file">Elegí tu archivo (.xlsx)</label>
@@ -731,10 +1051,22 @@ async def index() -> str:
               <button type="button" class="btn tiny" id="sel-none" style="margin-left:8px;">Vaciar selección</button>
             </div>
           </div>
-          <div class="stores-grid">
+          <div class="stores-grid" id="stores-grid">
             {stores_checkboxes}
           </div>
-          <div class="tiny" style="margin-top:6px;">Podés elegir una, varias o todas. Si no elegís ninguna, se usarán todas por defecto.</div>
+          <div class="tiny" style="margin-top:6px;">Podés elegir una, varias o todas.</div>
+
+          <div class="manual">
+            <div class="tiny" style="margin-bottom:6px;"><strong>Agregar tienda manual</strong> (para cualquier sitio web):</div>
+            <div class="row">
+              <input type="text" id="m-name" placeholder="Nombre (ej. Mi Super)" />
+              <input type="text" id="m-url" placeholder="URL base (ej. https://mi-super.com)" />
+              <button type="button" class="btn" id="m-add">Agregar tienda</button>
+            </div>
+            <div id="m-list"></div>
+            <!-- Contenedor donde agrego inputs ocultos con las tiendas manuales -->
+            <div id="m-hidden"></div>
+          </div>
         </div>
 
         <button class="btn" type="submit" id="btn">
@@ -744,7 +1076,7 @@ async def index() -> str:
         <div id="status" class="foot"></div>
       </form>
 
-      <div class="foot" style="margin-top:12px;">Tip: primero consultamos la API de VTEX por EAN/ft; si no hay match, vamos a la primera PDP de resultados. Para sitios no-VTEX buscamos el primer resultado real evitando login/ofertas/carrito.</div>
+      <div class="foot" style="margin-top:12px;">Tip: para tiendas manuales no hace falta programar nada; el motor detecta la plataforma y busca el primer producto.</div>
     </div>
   </div>
 <script>
@@ -753,14 +1085,89 @@ const btn = document.getElementById('btn');
 const btnText = document.getElementById('btn-text');
 const bar = document.getElementById('prog');
 const statusEl = document.getElementById('status');
+const grid = document.getElementById('stores-grid');
+const mName = document.getElementById('m-name');
+const mUrl  = document.getElementById('m-url');
+const mAdd  = document.getElementById('m-add');
+const mList = document.getElementById('m-list');
+const mHidden = document.getElementById('m-hidden');
 
 document.getElementById('sel-all').addEventListener('click', () => {
-  const boxes = document.querySelectorAll('input[name="stores"]');
-  for (const cb of boxes) cb.checked = true;
+  document.querySelectorAll('input[name="stores"]').forEach(cb => cb.checked = true);
 });
 document.getElementById('sel-none').addEventListener('click', () => {
-  const boxes = document.querySelectorAll('input[name="stores"]');
-  for (const cb of boxes) cb.checked = false;
+  document.querySelectorAll('input[name="stores"]').forEach(cb => cb.checked = false);
+});
+
+function slugify(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-z0-9]+/g,'_')
+    .replace(/^_+|_+$/g,'')
+    .substring(0, 40) || 'tienda';
+}
+
+function ensureUniqueSlug(base) {
+  let s = base, i = 1;
+  const existing = new Set(Array.from(document.querySelectorAll('input[name="stores"]')).map(x => x.value));
+  while (existing.has(s)) { s = base + '_' + (++i); }
+  return s;
+}
+
+function normalizeUrl(u) {
+  u = (u || '').trim();
+  if (!u) return '';
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '');
+  return u.replace(/\/+$/,'');
+}
+
+function addManualStore(name, url) {
+  const nice = name && name.trim() ? name.trim() : (new URL(url)).hostname.replace(/^www\./,'');
+  const slug = ensureUniqueSlug(slugify(nice));
+  // 1) Checkbox visible
+  const label = document.createElement('label');
+  label.className = 'store-opt';
+  label.innerHTML = `
+    <input type="checkbox" name="stores" value="${slug}" checked />
+    <span>${nice}</span>
+  `;
+  grid.appendChild(label);
+  // 2) Chip con botón de borrar
+  const chip = document.createElement('span');
+  chip.className = 'chip';
+  chip.dataset.slug = slug;
+  chip.innerHTML = `<b>${nice}</b> · ${url} <button type="button" aria-label="Quitar">✕</button>`;
+  chip.querySelector('button').addEventListener('click', () => removeManualStore(slug, chip));
+  mList.appendChild(chip);
+  // 3) Inputs ocultos (slug, name, url) para enviar al backend
+  const h1 = document.createElement('input'); h1.type = 'hidden'; h1.name = 'custom_slug'; h1.value = slug;
+  const h2 = document.createElement('input'); h2.type = 'hidden'; h2.name = 'custom_name'; h2.value = nice;
+  const h3 = document.createElement('input'); h3.type = 'hidden'; h3.name = 'custom_url';  h3.value = url;
+  h1.id = 'h_slug_'+slug; h2.id = 'h_name_'+slug; h3.id = 'h_url_'+slug;
+  mHidden.appendChild(h1); mHidden.appendChild(h2); mHidden.appendChild(h3);
+}
+
+function removeManualStore(slug, chip) {
+  // borrar chip
+  if (chip && chip.parentNode) chip.parentNode.removeChild(chip);
+  // borrar checkbox
+  const cb = Array.from(document.querySelectorAll('input[name="stores"]')).find(x => x.value === slug);
+  if (cb && cb.parentNode) cb.parentNode.parentNode.removeChild(cb.parentNode);
+  // borrar ocultos
+  ['slug','name','url'].forEach(k => {
+    const el = document.getElementById('h_'+k+'_'+slug);
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  });
+}
+
+mAdd.addEventListener('click', () => {
+  const url = normalizeUrl(mUrl.value);
+  if (!url) { alert('Pegá la URL base de la tienda'); return; }
+  try { new URL(url); } catch { alert('URL inválida'); return; }
+  const name = mName.value || '';
+  addManualStore(name, url);
+  mName.value = ''; mUrl.value = '';
 });
 
 form.addEventListener('submit', async (e) => {
