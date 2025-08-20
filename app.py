@@ -28,7 +28,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 # --------------------------- Configuración ---------------------------
@@ -47,6 +47,22 @@ STORES: Dict[str, str] = {
     "central_oeste": "https://www.centraloeste.com.ar",
     "atomo": "https://atomoconviene.com/atomo-ecommerce",
 }
+
+FRIENDLY_NAMES = {
+    "carrefour": "Carrefour",
+    "jumbo": "Jumbo",
+    "disco": "Disco",
+    "vea": "Vea",
+    "dia": "Día",
+    "farmacity": "Farmacity",
+    "mas_online": "Más Online",
+    "pigmento": "Perfumerías Pigmento",
+    "mercado_libre": "Mercado Libre",
+    "club_de_beneficios": "Club de Beneficios",
+    "central_oeste": "Central Oeste",
+    "atomo": "Átomo",
+}
+
 
 # Concurrencia (ajustá si necesitás ser más/menos agresivo)
 MAX_PARALLEL_PER_EAN = 6
@@ -478,22 +494,23 @@ LOOKUP_HANDLERS = {
 }
 
 
-async def process_eans(eans: List[str], progress_cb=None) -> pd.DataFrame:
+async def process_eans(eans: List[str], progress_cb=None, stores_map: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     rows = []
     sem = asyncio.Semaphore(MAX_PARALLEL_PER_EAN)
     total = len(eans)
     done = 0
+    stores = stores_map or STORES  # 👈 usar las elegidas o todas
 
     async with httpx.AsyncClient(follow_redirects=True, headers=DEFAULT_HEADERS) as client:
         for raw in eans:
             ean = sanitize_ean(raw)
             if not ean:
                 row = {"EAN": str(raw)}
-                for name in STORES.keys():
+                for name in stores.keys():
                     row[name] = "no encontrado"
                 rows.append(row)
                 done += 1
-                if progress_cb: progress_cb(done, total)     # 👈
+                if progress_cb: progress_cb(done, total)
                 continue
 
             async def task_for(store_name: str, base_url: str) -> str:
@@ -509,23 +526,23 @@ async def process_eans(eans: List[str], progress_cb=None) -> pd.DataFrame:
                     except Exception:
                         return "no encontrado"
 
-            tasks = [task_for(n, u) for n, u in STORES.items()]
+            tasks = [task_for(n, u) for n, u in stores.items()]
             results = await asyncio.gather(*tasks)
             row = {"EAN": ean}
-            for (name, _), url in zip(STORES.items(), results):
+            for (name, _), url in zip(stores.items(), results):
                 row[name] = url
             rows.append(row)
 
             done += 1
-            if progress_cb: progress_cb(done, total)         # 👈
+            if progress_cb: progress_cb(done, total)
 
     return pd.DataFrame(rows)
 
-async def run_job(job_id: str, eans: List[str]) -> None:
+async def run_job(job_id: str, eans: List[str], stores_map: Optional[Dict[str, str]] = None) -> None:
     def _cb(done: int, total: int) -> None:
         PROGRESS[job_id] = {"done": done, "total": total, "status": "running"}
 
-    df = await process_eans(eans, progress_cb=_cb)
+    df = await process_eans(eans, progress_cb=_cb, stores_map=stores_map)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -535,16 +552,17 @@ async def run_job(job_id: str, eans: List[str]) -> None:
     RESULTS[job_id] = buf
     PROGRESS[job_id] = {"done": len(eans), "total": len(eans), "status": "finished"}
 
-
 # --------------------------- FastAPI ---------------------------
 app = FastAPI(title="Buscador de URLs por EAN", version="1.0.0")
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
+async def upload(
+    file: UploadFile = File(...),
+    stores: Optional[List[str]] = Form(None)
+):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Subí un .xlsx (Excel moderno)")
 
-    # Leer Excel en memoria (forzar str para no perder ceros)
     raw = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(raw), dtype=str)
@@ -554,22 +572,17 @@ async def upload(file: UploadFile = File(...)):
     if df.empty:
         raise HTTPException(status_code=400, detail="El Excel está vacío")
 
-    # Detectar columna EAN (case-insensitive)
     cols_norm = {c.strip(): c for c in df.columns}
-    target_col = None
-    for c in cols_norm:
-        if c.lower() == "ean":
-            target_col = cols_norm[c]
-            break
+    target_col = next((cols_norm[c] for c in cols_norm if c.lower() == "ean"), None)
     if target_col is None:
         raise HTTPException(status_code=400, detail="No encontré una columna llamada 'EAN'")
 
     eans = [sanitize_ean(v) for v in df[target_col].tolist()]
 
-    # Procesar
-    out_df = await process_eans(eans)
+    selected = {k: v for k, v in STORES.items() if k in set(stores)} if stores else STORES
 
-    # Armar Excel en memoria
+    out_df = await process_eans(eans, stores_map=selected)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out_df.to_excel(writer, index=False, sheet_name="Resultados")
@@ -584,8 +597,12 @@ async def upload(file: UploadFile = File(...)):
             "Cache-Control": "no-store",
         },
     )
+
 @app.post("/start")
-async def start(file: UploadFile = File(...)):
+async def start(
+    file: UploadFile = File(...),
+    stores: Optional[List[str]] = Form(None)  # 👈 viene de los checkboxes name="stores"
+):
     if not file.filename.lower().endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Subí un .xlsx (Excel moderno)")
 
@@ -597,7 +614,7 @@ async def start(file: UploadFile = File(...)):
     if df.empty:
         raise HTTPException(status_code=400, detail="El Excel está vacío")
 
-    # columna EAN (case-insensitive)
+    # columna EAN
     cols_norm = {c.strip(): c for c in df.columns}
     target_col = next((cols_norm[c] for c in cols_norm if c.lower() == "ean"), None)
     if target_col is None:
@@ -605,9 +622,17 @@ async def start(file: UploadFile = File(...)):
 
     eans = [sanitize_ean(v) for v in df[target_col].tolist()]
 
+    # Filtrar tiendas según selección; si no vino nada, usamos todas.
+    if stores:
+        selected = {k: v for k, v in STORES.items() if k in set(stores)}
+        if not selected:
+            selected = STORES
+    else:
+        selected = STORES
+
     job_id = uuid4().hex
     PROGRESS[job_id] = {"done": 0, "total": len(eans), "status": "running"}
-    asyncio.create_task(run_job(job_id, eans))
+    asyncio.create_task(run_job(job_id, eans, stores_map=selected))
     return {"job_id": job_id, "total": len(eans)}
 
 @app.get("/progress/{job_id}")
@@ -630,7 +655,19 @@ async def download(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    return """
+    # construir lista de checkboxes con las tiendas disponibles
+    items = []
+    for key, url in STORES.items():
+        label = FRIENDLY_NAMES.get(key, key.replace("_", " ").title())
+        items.append(f'''
+          <label class="store-opt">
+            <input type="checkbox" name="stores" value="{key}" checked />
+            <span>{label}</span>
+          </label>
+        ''')
+    stores_checkboxes = "\n".join(items)
+
+    return f"""
 <!doctype html>
 <html lang="es">
 <head>
@@ -638,26 +675,33 @@ async def index() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Buscador de URLs por EAN</title>
   <style>
-    :root { --bg:#0b0c10; --card:#111318; --accent:#7c5cff; --text:#e7e9ee; --muted:#aab0bc; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial; background: var(--bg); color: var(--text); }
-    header { position:sticky; top:0; background:rgba(11,12,16,.8); backdrop-filter: blur(6px); border-bottom:1px solid rgba(255,255,255,.08); }
-    .nav { max-width: 1000px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; padding:12px 16px; }
-    .nav a { color: var(--text); text-decoration:none; opacity:.9; }
-    .nav a:hover { opacity:1; }
-    .wrap { min-height:100dvh; display:grid; place-items:center; padding: 24px; }
-    .card { width: 100%; max-width: 820px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border: 1px solid rgba(255,255,255,.08); border-radius: 20px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
-    h1 { margin:0 0 8px; font-size: 26px; letter-spacing: .3px; }
-    p.lead { margin:0 0 18px; color: var(--muted); }
-    ul { margin: 8px 0 20px 22px; color: var(--muted); }
-    .upload { display:flex; flex-direction:column; gap:16px; margin-top: 14px; }
-    label { font-size:14px; color: var(--muted); }
-    input[type=file] { padding: 18px; border-radius: 14px; border: 1px dashed rgba(255,255,255,.18); background: rgba(255,255,255,.02); color: var(--text); }
-    .btn { display:inline-flex; align-items:center; gap:10px; padding: 12px 18px; background: var(--accent); color:#fff; border:0; border-radius: 12px; font-weight:600; cursor:pointer; }
-    .btn[disabled] { opacity:.7; cursor:not-allowed; }
-    .btn:hover { filter: brightness(1.05); }
-    .foot { font-size: 12px; color: var(--muted); }
-    .bar { width:100%; height:14px; border-radius: 10px; }
+    :root {{ --bg:#0b0c10; --card:#111318; --accent:#7c5cff; --text:#e7e9ee; --muted:#aab0bc; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial; background: var(--bg); color: var(--text); }}
+    header {{ position:sticky; top:0; background:rgba(11,12,16,.8); backdrop-filter: blur(6px); border-bottom:1px solid rgba(255,255,255,.08); }}
+    .nav {{ max-width: 1000px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; padding:12px 16px; }}
+    .nav a {{ color: var(--text); text-decoration:none; opacity:.9; }}
+    .nav a:hover {{ opacity:1; }}
+    .wrap {{ min-height:100dvh; display:grid; place-items:center; padding: 24px; }}
+    .card {{ width: 100%; max-width: 920px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border: 1px solid rgba(255,255,255,.08); border-radius: 20px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }}
+    h1 {{ margin:0 0 8px; font-size: 26px; letter-spacing: .3px; }}
+    p.lead {{ margin:0 0 18px; color: var(--muted); }}
+    ul {{ margin: 8px 0 20px 22px; color: var(--muted); }}
+    .upload {{ display:flex; flex-direction:column; gap:16px; margin-top: 14px; }}
+    label {{ font-size:14px; color: var(--muted); }}
+    input[type=file] {{ padding: 18px; border-radius: 14px; border: 1px dashed rgba(255,255,255,.18); background: rgba(255,255,255,.02); color: var(--text); }}
+    .btn {{ display:inline-flex; align-items:center; gap:10px; padding: 12px 18px; background: var(--accent); color:#fff; border:0; border-radius: 12px; font-weight:600; cursor:pointer; }}
+    .btn[disabled] {{ opacity:.7; cursor:not-allowed; }}
+    .btn:hover {{ filter: brightness(1.05); }}
+    .foot {{ font-size: 12px; color: var(--muted); }}
+    .bar {{ width:100%; height:14px; border-radius: 10px; }}
+
+    .stores-box {{ border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:12px; }}
+    .stores-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }}
+    .stores-grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:10px; }}
+    .store-opt {{ display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; }}
+    .store-opt:hover {{ background:rgba(255,255,255,.04); }}
+    .tiny {{ font-size:12px; color:var(--muted); }}
   </style>
 </head>
 <body>
@@ -673,22 +717,34 @@ async def index() -> str:
   <div class="wrap">
     <div class="card">
       <h1>🔎 Procesar Excel con EAN</h1>
-      <p class="lead">Subí un <strong>Excel (.xlsx)</strong> con una columna llamada <code>EAN</code>. Te devuelvo otro Excel con el primer resultado por tienda.</p>
-      <ul>
-        <li>Tiendas: Carrefour, Jumbo, Disco, Vea, Día, Farmacity, Más Online, Pigmento, Coto, Mercado Libre y Club de Beneficios.</li>
-        <li>Si no se encuentra el producto en un sitio, verás <em>"no encontrado"</em>.</li>
-        <li>Los códigos se tratan como texto para preservar ceros a la izquierda.</li>
-      </ul>
+      <p class="lead">Subí un <strong>Excel (.xlsx)</strong> con una columna llamada <code>EAN</code>. Elegí en qué tiendas buscar y te devuelvo otro Excel con el primer resultado por tienda.</p>
+
       <form class="upload" id="form" enctype="multipart/form-data">
         <label for="file">Elegí tu archivo (.xlsx)</label>
         <input id="file" name="file" type="file" accept=".xlsx" required />
+
+        <div class="stores-box">
+          <div class="stores-head">
+            <strong>Tiendas a consultar</strong>
+            <div>
+              <button type="button" class="btn tiny" id="sel-all">Seleccionar todas</button>
+              <button type="button" class="btn tiny" id="sel-none" style="margin-left:8px;">Vaciar selección</button>
+            </div>
+          </div>
+          <div class="stores-grid">
+            {stores_checkboxes}
+          </div>
+          <div class="tiny" style="margin-top:6px;">Podés elegir una, varias o todas. Si no elegís ninguna, se usarán todas por defecto.</div>
+        </div>
+
         <button class="btn" type="submit" id="btn">
           <span id="btn-text">Procesar y descargar Excel</span>
         </button>
         <progress id="prog" class="bar" value="0" max="100"></progress>
         <div id="status" class="foot"></div>
       </form>
-      <div class="foot" style="margin-top:12px;">Tip: primero consultamos la API de VTEX por EAN/ft; si no hay match, vamos a la primera PDP de resultados. Para ML verificamos EAN cuando es posible; para Coto usamos texto + validaciones.</div>
+
+      <div class="foot" style="margin-top:12px;">Tip: primero consultamos la API de VTEX por EAN/ft; si no hay match, vamos a la primera PDP de resultados. Para sitios no-VTEX buscamos el primer resultado real evitando login/ofertas/carrito.</div>
     </div>
   </div>
 <script>
@@ -698,6 +754,13 @@ const btnText = document.getElementById('btn-text');
 const bar = document.getElementById('prog');
 const statusEl = document.getElementById('status');
 
+document.getElementById('sel-all').addEventListener('click', () => {
+  document.querySelectorAll('input[name="stores"]').forEach(cb => cb.checked = true);
+});
+document.getElementById('sel-none').addEventListener('click', () => {
+  document.querySelectorAll('input[name="stores"]').forEach(cb => cb.checked = false);
+});
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!document.getElementById('file').files.length) return;
@@ -705,10 +768,10 @@ form.addEventListener('submit', async (e) => {
   const fd = new FormData(form);
   try {
     const start = await fetch('/start', { method: 'POST', body: fd });
-    if (!start.ok) {
+    if (!start.ok) {{
       const txt = await start.text();
       throw new Error(txt || 'Error iniciando el procesamiento');
-    }
+    }}
     const data = await start.json();
     await poll(data.job_id);
   } catch (err) {
@@ -717,40 +780,40 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
-function toggle(loading) {
-  if (loading) {
+function toggle(loading) {{
+  if (loading) {{
     btn.setAttribute('disabled','true');
     btnText.textContent = 'Procesando…';
     bar.value = 0;
     statusEl.textContent = '';
-  } else {
+  }} else {{
     btn.removeAttribute('disabled');
     btnText.textContent = 'Procesar y descargar Excel';
-  }
-}
+  }}
+}}
 
-async function poll(job) {
+async function poll(job) {{
   let finished = false;
-  while (!finished) {
+  while (!finished) {{
     await new Promise(r => setTimeout(r, 600));
-    const r = await fetch(`/progress/${job}`);
+    const r = await fetch(`/progress/${{job}}`);
     if (!r.ok) continue;
     const p = await r.json();
     const done = p.done || 0;
     const total = p.total || 1;
     const percent = Math.floor((done / total) * 100);
     bar.value = percent;
-    statusEl.textContent = `Procesado ${done}/${total} (${percent}%)`;
+    statusEl.textContent = `Procesado ${{done}}/${{total}} (${{percent}}%)`;
     finished = p.status === 'finished' || done >= total;
-  }
+  }}
   statusEl.textContent = 'Listo. Descargando…';
-  window.location.href = `/download/${job}`;
+  window.location.href = `/download/${{job}}`;
   toggle(false);
-}
+}}
 </script>
 </body>
 </html>
-    """
+    """.replace("{stores_checkboxes}", stores_checkboxes)
 
 @app.get("/info", response_class=HTMLResponse)
 async def info() -> str:
