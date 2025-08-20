@@ -667,7 +667,7 @@ async def index() -> str:
         ''')
     stores_checkboxes = "\n".join(items)
 
-    return f"""
+    return """
 <!doctype html>
 <html lang="es">
 <head>
@@ -675,33 +675,33 @@ async def index() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Buscador de URLs por EAN</title>
   <style>
-    :root {{ --bg:#0b0c10; --card:#111318; --accent:#7c5cff; --text:#e7e9ee; --muted:#aab0bc; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial; background: var(--bg); color: var(--text); }}
-    header {{ position:sticky; top:0; background:rgba(11,12,16,.8); backdrop-filter: blur(6px); border-bottom:1px solid rgba(255,255,255,.08); }}
-    .nav {{ max-width: 1000px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; padding:12px 16px; }}
-    .nav a {{ color: var(--text); text-decoration:none; opacity:.9; }}
-    .nav a:hover {{ opacity:1; }}
-    .wrap {{ min-height:100dvh; display:grid; place-items:center; padding: 24px; }}
-    .card {{ width: 100%; max-width: 920px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border: 1px solid rgba(255,255,255,.08); border-radius: 20px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }}
-    h1 {{ margin:0 0 8px; font-size: 26px; letter-spacing: .3px; }}
-    p.lead {{ margin:0 0 18px; color: var(--muted); }}
-    ul {{ margin: 8px 0 20px 22px; color: var(--muted); }}
-    .upload {{ display:flex; flex-direction:column; gap:16px; margin-top: 14px; }}
-    label {{ font-size:14px; color: var(--muted); }}
-    input[type=file] {{ padding: 18px; border-radius: 14px; border: 1px dashed rgba(255,255,255,.18); background: rgba(255,255,255,.02); color: var(--text); }}
-    .btn {{ display:inline-flex; align-items:center; gap:10px; padding: 12px 18px; background: var(--accent); color:#fff; border:0; border-radius: 12px; font-weight:600; cursor:pointer; }}
-    .btn[disabled] {{ opacity:.7; cursor:not-allowed; }}
-    .btn:hover {{ filter: brightness(1.05); }}
-    .foot {{ font-size: 12px; color: var(--muted); }}
-    .bar {{ width:100%; height:14px; border-radius: 10px; }}
+    :root { --bg:#0b0c10; --card:#111318; --accent:#7c5cff; --text:#e7e9ee; --muted:#aab0bc; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial; background: var(--bg); color: var(--text); }
+    header { position:sticky; top:0; background:rgba(11,12,16,.8); backdrop-filter: blur(6px); border-bottom:1px solid rgba(255,255,255,.08); }
+    .nav { max-width: 1000px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; padding:12px 16px; }
+    .nav a { color: var(--text); text-decoration:none; opacity:.9; }
+    .nav a:hover { opacity:1; }
+    .wrap { min-height:100dvh; display:grid; place-items:center; padding: 24px; }
+    .card { width: 100%; max-width: 920px; background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02)); border: 1px solid rgba(255,255,255,.08); border-radius: 20px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+    h1 { margin:0 0 8px; font-size: 26px; letter-spacing: .3px; }
+    p.lead { margin:0 0 18px; color: var(--muted); }
+    ul { margin: 8px 0 20px 22px; color: var(--muted); }
+    .upload { display:flex; flex-direction:column; gap:16px; margin-top: 14px; }
+    label { font-size:14px; color: var(--muted); }
+    input[type=file] { padding: 18px; border-radius: 14px; border: 1px dashed rgba(255,255,255,.18); background: rgba(255,255,255,.02); color: var(--text); }
+    .btn { display:inline-flex; align-items:center; gap:10px; padding: 12px 18px; background: var(--accent); color:#fff; border:0; border-radius: 12px; font-weight:600; cursor:pointer; }
+    .btn[disabled] { opacity:.7; cursor:not-allowed; }
+    .btn:hover { filter: brightness(1.05); }
+    .foot { font-size: 12px; color: var(--muted); }
+    .bar { width:100%; height:14px; border-radius: 10px; }
 
-    .stores-box {{ border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:12px; }}
-    .stores-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }}
-    .stores-grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:10px; }}
-    .store-opt {{ display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; }}
-    .store-opt:hover {{ background:rgba(255,255,255,.04); }}
-    .tiny {{ font-size:12px; color:var(--muted); }}
+    .stores-box { border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:12px; }
+    .stores-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }
+    .stores-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:10px; }
+    .store-opt { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; }
+    .store-opt:hover { background:rgba(255,255,255,.04); }
+    .tiny { font-size:12px; color:var(--muted); }
   </style>
 </head>
 <body>
@@ -755,10 +755,12 @@ const bar = document.getElementById('prog');
 const statusEl = document.getElementById('status');
 
 document.getElementById('sel-all').addEventListener('click', () => {
-  document.querySelectorAll('input[name="stores"]').forEach(cb => cb.checked = true);
+  const boxes = document.querySelectorAll('input[name="stores"]');
+  for (const cb of boxes) cb.checked = true;
 });
 document.getElementById('sel-none').addEventListener('click', () => {
-  document.querySelectorAll('input[name="stores"]').forEach(cb => cb.checked = false);
+  const boxes = document.querySelectorAll('input[name="stores"]');
+  for (const cb of boxes) cb.checked = false;
 });
 
 form.addEventListener('submit', async (e) => {
@@ -768,10 +770,10 @@ form.addEventListener('submit', async (e) => {
   const fd = new FormData(form);
   try {
     const start = await fetch('/start', { method: 'POST', body: fd });
-    if (!start.ok) {{
+    if (!start.ok) {
       const txt = await start.text();
       throw new Error(txt || 'Error iniciando el procesamiento');
-    }}
+    }
     const data = await start.json();
     await poll(data.job_id);
   } catch (err) {
@@ -780,36 +782,36 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
-function toggle(loading) {{
-  if (loading) {{
+function toggle(loading) {
+  if (loading) {
     btn.setAttribute('disabled','true');
     btnText.textContent = 'Procesando…';
     bar.value = 0;
     statusEl.textContent = '';
-  }} else {{
+  } else {
     btn.removeAttribute('disabled');
     btnText.textContent = 'Procesar y descargar Excel';
-  }}
-}}
+  }
+}
 
-async function poll(job) {{
+async function poll(job) {
   let finished = false;
-  while (!finished) {{
+  while (!finished) {
     await new Promise(r => setTimeout(r, 600));
-    const r = await fetch(`/progress/${{job}}`);
+    const r = await fetch(`/progress/${job}`);
     if (!r.ok) continue;
     const p = await r.json();
     const done = p.done || 0;
     const total = p.total || 1;
     const percent = Math.floor((done / total) * 100);
     bar.value = percent;
-    statusEl.textContent = `Procesado ${{done}}/${{total}} (${{percent}}%)`;
+    statusEl.textContent = `Procesado ${done}/${total} (${percent}%)`;
     finished = p.status === 'finished' || done >= total;
-  }}
+  }
   statusEl.textContent = 'Listo. Descargando…';
-  window.location.href = `/download/${{job}}`;
+  window.location.href = `/download/${job}`;
   toggle(false);
-}}
+}
 </script>
 </body>
 </html>
