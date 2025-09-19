@@ -43,7 +43,7 @@ STORES: Dict[str, str] = {
     "farmacity": "https://www.farmacity.com",
     "mas_online": "https://www.masonline.com.ar",
     "pigmento": "https://www.perfumeriaspigmento.com.ar",
-    "mercado_libre": "https://listado.mercadolibre.com.ar",
+    "mercado_libre": "https://www.mercadolibre.com.ar/supermercado/market",
     "club_de_beneficios": "https://clubdebeneficios.com",
     "central_oeste": "https://www.centraloeste.com.ar",
     "atomo": "https://atomoconviene.com/atomo-ecommerce",
@@ -505,7 +505,7 @@ async def lookup_meli_robusto(client: httpx.AsyncClient, store_name: str, base_u
     except Exception:
         pass
 
-    bases = [base_url.rstrip("/"), "https://www.mercadolibre.com.ar"]
+    bases = [base_url.rstrip("/"), "https://www.mercadolibre.com.ar/supermercado/market"]
     paths = [f"/{ean}", f"/jm/search?as_word={ean}", f"/ofertas?query={ean}"]
 
     def looks_like_meli_item(u: str) -> bool:
