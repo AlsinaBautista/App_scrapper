@@ -487,10 +487,141 @@ async def lookup_generic(client: httpx.AsyncClient, store_name: str, base_url: s
     return "no encontrado"
 
 async def lookup_meli_robusto(client: httpx.AsyncClient, store_name: str, base_url: str, ean: str) -> str:
-    """Mercado Libre: intentar API pública y caer a HTML si hace falta.
-    - API (puede requerir token en 2025): /sites/MLA/search?q=<EAN>
-    - HTML: listado y rutas alternativas; devolver primer permalink a ítem (/MLA-...) o PDP de catálogo (/p/MLA...)
     """
+    Mercado Libre robusto:
+    - Busca primero en listado (supermercado/market y listado general).
+    - Prefiere /p/MLA (catálogo). Fallback a /MLA- (ítem clásico).
+    - Si aterriza en PDP, devuelve canonical/og:url.
+    - La API pública queda como último recurso (suele rate-limitar).
+    """
+    def _abs(u: str) -> str:
+        if not u: return ""
+        u = u.strip()
+        if u.startswith("//"): return "https:" + u
+        if u.startswith("http"): return u
+        return urljoin("https://www.mercadolibre.com.ar/", u.lstrip("/"))
+
+    def _is_banned(u: str) -> bool:
+        low = (u or "").lower()
+        return any(b in low for b in ("/login", "/account", "/ayuda", "/help", "/seguridad", "/cart", "/checkout"))
+
+    def _is_meli(u: str) -> bool:
+        try:
+            return "mercadolibre.com" in urlparse(u).netloc
+        except Exception:
+            return False
+
+    def _is_catalog(u: str) -> bool:
+        # URLs de catálogo (PDP “nueva”)
+        try:
+            return _is_meli(u) and "/p/MLA" in urlparse(u).path
+        except Exception:
+            return False
+
+    def _is_item(u: str) -> bool:
+        # URLs de ítem clásico
+        try:
+            p = urlparse(u).path
+            return _is_meli(u) and ("/MLA-" in p or "/item/" in p or "/up/MLA" in p)
+        except Exception:
+            return False
+
+    def _pick_first_product_from_html(html: str) -> Optional[str]:
+        if not html: 
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1) Si ya estamos en PDP, devolvé canonical/og:url
+        can = soup.find("link", rel=lambda v: v and "canonical" in v)
+        if can and can.get("href"):
+            href = _abs(can["href"])
+            if _is_catalog(href) or _is_item(href):
+                return href
+
+        og = soup.find("meta", attrs={"property": "og:url"})
+        if og and og.get("content"):
+            href = _abs(og["content"])
+            if _is_catalog(href) or _is_item(href):
+                return href
+
+        # 2) Preferir /p/MLA…
+        a = soup.select_one('a[href*="/p/MLA"]')
+        if a and a.get("href"):
+            href = _abs(a["href"])
+            if not _is_banned(href) and _is_catalog(href):
+                return href
+
+        # 3) Fallback: cualquier anchor que parezca item clásico
+        for tag in soup.find_all("a", href=True):
+            href = _abs(tag["href"])
+            if not href or _is_banned(href) or not _is_meli(href):
+                continue
+            if _is_item(href):
+                return href
+
+        # 4) A veces vienen en data-attrs
+        for tag in soup.select("[data-url], [data-href], [data-link]"):
+            href = tag.get("data-url") or tag.get("data-href") or tag.get("data-link")
+            href = _abs(href or "")
+            if href and not _is_banned(href) and (_is_catalog(href) or _is_item(href)):
+                return href
+
+        return None
+
+    # --- 1) Listado (market + general) ---
+    # Cubrimos tus ejemplos:
+    #  - https://listado.mercadolibre.com.ar/supermercado/market/<EAN>?sb=storefront_url
+    #  - https://listado.mercadolibre.com.ar/<EAN>
+    #  - + variantes de /jm/search y /ofertas en www.
+    bases = [
+        "https://listado.mercadolibre.com.ar/supermercado/market",
+        "https://listado.mercadolibre.com.ar",
+        "https://www.mercadolibre.com.ar/supermercado/market",
+        "https://www.mercadolibre.com.ar",
+    ]
+    paths = [
+        f"/{ean}",
+        f"/jm/search?as_word={ean}",
+        f"/ofertas?query={ean}",
+        f"/busca/{ean}",  # en algunos entornos existe /busca/<q>
+    ]
+
+    for b in bases:
+        # Primer intento: ruta directa estilo listado
+        prime_urls = [f"{b.rstrip('/')}/{ean}"]
+        # Si es “supermercado/market” en listado, agrego el típico sb=storefront_url
+        if "listado.mercadolibre.com.ar/supermercado/market" in b:
+            prime_urls.append(f"{b.rstrip('/')}/{ean}?sb=storefront_url")
+
+        # Luego las rutas de búsqueda conocidas
+        candidate_urls = prime_urls + [b.rstrip('/') + p for p in paths]
+
+        for url in candidate_urls:
+            try:
+                html = await fetch_text(client, url)
+            except Exception:
+                html = None
+            if not html:
+                continue
+            picked = _pick_first_product_from_html(html)
+            if picked:
+                # Si lo que elegimos NO es /p/MLA, pero es un item MLA-,
+                # intentamos resolver el canonical de su PDP para estabilizar la URL.
+                try:
+                    if not _is_catalog(picked):
+                        pdp = await fetch_text(client, picked)
+                        if pdp:
+                            soup = BeautifulSoup(pdp, "html.parser")
+                            can = soup.find("link", rel=lambda v: v and "canonical" in v)
+                            if can and can.get("href"):
+                                href = _abs(can["href"])
+                                if _is_catalog(href) or _is_item(href):
+                                    picked = href
+                except Exception:
+                    pass
+                return picked
+
+    # --- 2) Último recurso: API pública (suele rate-limitar) ---
     api = f"https://api.mercadolibre.com/sites/MLA/search?q={ean}&limit=1"
     try:
         r = await client.get(api, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
@@ -504,40 +635,6 @@ async def lookup_meli_robusto(client: httpx.AsyncClient, store_name: str, base_u
                         return link
     except Exception:
         pass
-
-    bases = [base_url.rstrip("/"), "https://www.mercadolibre.com.ar/supermercado/market"]
-    paths = [f"/{ean}", f"/jm/search?as_word={ean}", f"/ofertas?query={ean}"]
-
-    def looks_like_meli_item(u: str) -> bool:
-        try:
-            uu = urlparse(u)
-        except Exception:
-            return False
-        host_ok = "mercadolibre" in uu.netloc
-        path = uu.path
-        return host_ok and ("/MLA-" in path or "/p/MLA" in path or "/item/" in path or "/up/MLA" in path)
-
-    for b in bases:
-        for p in paths:
-            url = b + p
-            html = await fetch_text(client, url)
-            if not html:
-                continue
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if not href:
-                    continue
-                full = href if href.startswith("http") else urljoin("https://www.mercadolibre.com.ar/", href)
-                if looks_like_meli_item(full) and not any(x in full for x in ("/login", "/account", "/ayuda", "/help", "/seguridad")):
-                    return full
-            for tag in soup.select("[data-url], [data-href], [data-link]"):
-                val = tag.get("data-url") or tag.get("data-href") or tag.get("data-link")
-                if not val:
-                    continue
-                full = val if val.startswith("http") else urljoin("https://www.mercadolibre.com.ar/", val)
-                if looks_like_meli_item(full) and not any(x in full for x in ("/login", "/account", "/ayuda", "/help", "/seguridad")):
-                    return full
 
     return "no encontrado"
 
